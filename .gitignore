@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
@@ -172,3 +173,12 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+=======
+__pycache__/
+*.pyc
+transactions_cache.json.gz
+script.log
+.env
+venv/
+static/
+>>>>>>> e3b3aef (Initial commit: Wallet checker with FastAPI and Vercel config)
