@@ -14,11 +14,10 @@ import gzip
 
 # Konfigurasi logging
 logging.basicConfig(
-    level=logging.WARNING,
+    level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
     handlers=[
-        logging.FileHandler("script.log"),
-        logging.StreamHandler()
+        logging.StreamHandler()  # Log ke stdout, ditangkap oleh Vercel
     ]
 )
 logger = logging.getLogger(__name__)
