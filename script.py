@@ -1,3 +1,5 @@
+import logging
+import aiohttp
 from web3 import Web3
 import requests
 import json
