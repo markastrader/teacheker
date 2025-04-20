@@ -1,9 +1,13 @@
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from typing import List
-import asyncio
-from script import process_wallet, clear_cache
 import aiohttp
+import asyncio
+import logging
+from script import process_wallet, clear_cache
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+logger = logging.getLogger(__name__)
 
 app = FastAPI()
 
@@ -12,37 +16,24 @@ class WalletRequest(BaseModel):
 
 @app.post("/check")
 async def check_wallets(request: WalletRequest):
+    logger.info("Starting wallet check for %s", request.wallets)
     try:
-        # Bersihkan cache di awal
         clear_cache()
-        
-        # Validasi alamat dompet
         invalid_wallets = [w for w in request.wallets if not w.startswith("0x") or len(w) != 42]
         if invalid_wallets:
             raise HTTPException(status_code=400, detail=f"Invalid wallet addresses: {invalid_wallets}")
-        
-        # Proses setiap dompet
         results = []
         async with aiohttp.ClientSession() as session:
-            for wallet in request.wallets:
-                # Tangkap output konsol
-                from io import StringIO
-                import sys
-                old_stdout = sys.stdout
-                sys.stdout = StringIO()
-                
-                try:
-                    await process_wallet(wallet, session)
-                    output = sys.stdout.getvalue()
+            tasks = [process_wallet(wallet, session) for wallet in request.wallets]
+            logger.info("Processing %d wallets", len(tasks))
+            outputs = await asyncio.gather(*tasks, return_exceptions=True)
+            for wallet, output in zip(request.wallets, outputs):
+                if isinstance(output, Exception):
+                    results.append({"wallet": wallet, "error": str(output)})
+                else:
                     results.append({"wallet": wallet, "output": output})
-                finally:
-                    sys.stdout = old_stdout
-        
+        logger.info("Completed wallet check")
         return {"status": "success", "results": results}
-    
     except Exception as e:
+        logger.error("Error in check_wallets: %s", str(e))
         raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/")
-async def root():
-    return {"message": "Wallet Checker API. Use POST /check with a list of wallet addresses."}

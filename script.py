@@ -1,35 +1,122 @@
 import logging
 import aiohttp
-from web3 import Web3
-import requests
-import json
-import os
-from datetime import datetime, timezone, timedelta
-import logging
-import aiohttp
 import asyncio
 import random
 from tabulate import tabulate
 import gzip
+import json
+import os
+from datetime import datetime, timezone, timedelta
+from web3 import Web3
+import requests
+import time  # Tambahkan ini
 
 # Konfigurasi logging
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.WARNING,
     format="%(asctime)s - %(levelname)s - %(message)s",
     handlers=[
-        logging.StreamHandler()  # Log ke stdout, ditangkap oleh Vercel
+        logging.StreamHandler()  # Hanya stdout untuk Vercel
     ]
 )
 logger = logging.getLogger(__name__)
+
+# Tambahkan cache signature di atas CONFIG
+SIGNATURE_CACHE = {}
+
+async def lookup_signature(session, signature):
+    if signature in SIGNATURE_CACHE:
+        return SIGNATURE_CACHE[signature]
+    params = {"function": signature}
+    try:
+        async with session.get(CONFIG["OPENCHAIN_API"], params=params, timeout=3) as response:
+            if response.status == 200:
+                data = await response.json()
+                results = data.get("result", {}).get("function", {}).get(signature, [])
+                names = [r["name"] for r in results] if results else [f"Unknown ({signature})"]
+                SIGNATURE_CACHE[signature] = names
+                return names
+            return [f"Unknown ({signature})"]
+    except Exception as e:
+        logger.error(f"Error mencari signature {signature}: {e}")
+        return [f"Unknown ({signature})"]
+
+async def check_methods(transactions, token_transactions, wallet_address):
+    method_status = {method: False for method in CONFIG["METHODS"]}
+    method_details = {method: [] for method in CONFIG["METHODS"]}
+    all_functions = set()
+    
+    # Batasi jumlah transaksi untuk analisis
+    transactions = transactions[:100]
+    token_transactions = token_transactions[:100]
+    
+    # Mengumpulkan signature unik
+    signatures = set()
+    for tx in transactions:
+        input_data = tx.get("input", "0x")
+        if input_data != "0x" and len(input_data) >= 10:
+            signatures.add(input_data[:10])
+    
+    # Mencari nama fungsi
+    async with aiohttp.ClientSession() as session:
+        tasks = [lookup_signature(session, sig) for sig in signatures]
+        results = await asyncio.gather(*tasks)
+        for sig, names in zip(signatures, results):
+            for name in names:
+                all_functions.add(f"{name} ({sig})")
+    
+    # Analisis transaksi (tanpa perubahan besar)
+    for tx in transactions:
+        tx_hash = tx.get("hash", "unknown")
+        if float(tx["value"]) > 0:
+            value_in_eth = w3.from_wei(int(tx["value"]), "ether")
+            if value_in_eth == 50 and tx["to"].lower() == wallet_address.lower():
+                method_status["Claim Faucet"] = True
+                method_details["Claim Faucet"].append(f"Tx: {tx_hash}, From: {tx['from']}, Value: 50 ETH")
+            method_status["Transfer"] = True
+            method_details["Transfer"].append(f"Tx: {tx_hash}, Value: {value_in_eth} ETH")
+        if tx["from"].lower() == CONFIG["FAUCET_ADDRESS"].lower() and float(tx["value"]) == 50:
+            method_status["Claim Faucet"] = True
+            method_details["Claim Faucet"].append(f"Tx: {tx_hash}, From: {tx['from']}, Value: 50 ETH")
+        if tx["to"] == "" and tx.get("contractAddress"):
+            method_status["Deploy"] = True
+            method_details["Deploy"].append(f"Tx: {tx_hash}, Contract: {tx['contractAddress']}")
+        input_data = tx.get("input", "0x")
+        if input_data != "0x" and len(input_data) >= 10:
+            function_signature = input_data[:10]
+            logger.debug(f"Transaksi {tx_hash}: Signature {function_signature}, Contract: {tx.get('to', 'unknown')}")
+            for method, signature in CONFIG["METHODS"].items():
+                signatures_to_check = signature if isinstance(signature, list) else [signature]
+                if function_signature in signatures_to_check and signature is not None:
+                    method_status[method] = True
+                    method_details[method].append(f"Tx: {tx_hash}, Contract: {tx.get('to', 'unknown')}")
+                    logger.info(f"{method} terdeteksi untuk {wallet_address}: Tx {tx_hash}, Signature {function_signature}")
+                elif function_signature in signatures_to_check:
+                    logger.warning(f"Transaksi {tx_hash} memiliki signature {function_signature} tetapi tidak ditandai untuk {method}")
+    
+    for tx in token_transactions:
+        tx_hash = tx.get("hash", "unknown")
+        if "tokenStandard" in tx and tx["tokenStandard"] == "ERC-721":
+            method_status["Mint NFT"] = True
+            method_details["Mint NFT"].append(f"Tx: {tx_hash}, Token: {tx.get('tokenName')}")
+        if "tokenStandard" in tx and tx["tokenStandard"] == "ERC-20":
+            value = float(tx.get("value", 0)) / (10 ** int(tx.get("tokenDecimal", 18)))
+            if value == 50 and tx["to"].lower() == wallet_address.lower():
+                method_status["Claim Faucet"] = True
+                method_details["Claim Faucet"].append(f"Tx: {tx_hash}, From: {tx['from']}, Value: 50 {tx.get('tokenSymbol', 'Token')}")
+            method_status["Transfer"] = True
+            method_details["Transfer"].append(f"Tx: {tx_hash}, Token: {tx.get('tokenName')}")
+
+    return method_status, method_details, all_functions
 
 # Konfigurasi
 CONFIG = {
     "BLOCKSCOUT_API": "https://sepolia.tea.xyz/api",
     "OPENCHAIN_API": "https://api.openchain.xyz/signature-database/v1/lookup",
     "RPC_URL": "https://tea-sepolia.g.alchemy.com/v2/{}",
-    "CACHE_FILE": "transactions_cache.json.gz",
+    "CACHE_FILE": "/tmp/transactions_cache.json.gz",  # Pindah ke /tmp
     "FAUCET_ADDRESS": "0xD991A4bb721f2E9A5E62449FA617274901e6ADDe",
-    "PAGE_SIZE": 1000,
+    "PAGE_SIZE": 100,  # Kurangi untuk pengujian
     "CACHE_TTL_MINUTES": 60,
     "API_KEYS": [
         os.getenv("ALCHEMY_API_KEY_1", "qgL6v56zfbr--COQOAxgCugruEzQjQJ4"),
@@ -103,7 +190,7 @@ def load_cache(wallet_address):
             return cached_data
         logger.info(f"Cache untuk {wallet_address} kadaluarsa, akan mengambil data baru.")
         return {}
-    except FileNotFoundError:
+    except (FileNotFoundError, json.JSONDecodeError):
         return {}
 
 def save_cache(wallet_address, data):
@@ -111,15 +198,18 @@ def save_cache(wallet_address, data):
     try:
         with gzip.open(CONFIG["CACHE_FILE"], "rt", encoding="utf-8") as f:
             cache = json.load(f)
-    except FileNotFoundError:
+    except (FileNotFoundError, json.JSONDecodeError):
         pass
     cache[wallet_address] = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "transactions": data["transactions"],
         "token_transactions": data["token_transactions"]
     }
-    with gzip.open(CONFIG["CACHE_FILE"], "wt", encoding="utf-8") as f:
-        json.dump(cache, f, indent=2)
+    try:
+        with gzip.open(CONFIG["CACHE_FILE"], "wt", encoding="utf-8") as f:
+            json.dump(cache, f, indent=2)
+    except Exception as e:
+        logger.error(f"Error menyimpan cache: {e}")
 
 # Fungsi untuk menghapus cache
 def clear_cache():
@@ -146,7 +236,7 @@ async def get_transactions_blockscout_async(session, wallet_address):
             "offset": CONFIG["PAGE_SIZE"]
         }
         try:
-            async with session.get(CONFIG["BLOCKSCOUT_API"], params=params, timeout=20) as response:
+            async with session.get(CONFIG["BLOCKSCOUT_API"], params=params, timeout=5) as response:
                 if response.status == 200:
                     data = await response.json()
                     if data["status"] == "1":
@@ -163,7 +253,7 @@ async def get_transactions_blockscout_async(session, wallet_address):
                         break
                 elif response.status == 429:
                     logger.warning(f"Rate limit untuk Blockscout, menunggu...")
-                    await asyncio.sleep(5)
+                    await asyncio.sleep(2)
                 else:
                     logger.error(f"Error fetching transactions for {wallet_address}: HTTP {response.status}")
                     break
@@ -172,6 +262,48 @@ async def get_transactions_blockscout_async(session, wallet_address):
             break
     logger.warning(f"Total {len(transactions)} transaksi diambil dari Blockscout untuk {wallet_address}")
     return transactions
+
+async def get_token_transactions_blockscout_async(session, wallet_address):
+    token_transactions = []
+    page = 1
+    while True:
+        params = {
+            "module": "account",
+            "action": "tokentx",
+            "address": wallet_address,
+            "startblock": 0,
+            "endblock": "latest",
+            "sort": "asc",
+            "page": page,
+            "offset": CONFIG["PAGE_SIZE"]
+        }
+        try:
+            async with session.get(CONFIG["BLOCKSCOUT_API"], params=params, timeout=5) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    if data["status"] == "1":
+                        page_transactions = data["result"]
+                        token_transactions.extend(page_transactions)
+                        if len(page_transactions) < CONFIG["PAGE_SIZE"]:
+                            break
+                        page += 1
+                    elif data["status"] == "0" and "No token transfers found" in data.get("message", ""):
+                        logger.info(f"Tidak ada transaksi token ditemukan di Blockscout untuk {wallet_address}")
+                        break
+                    else:
+                        logger.error(f"Error fetching token transactions for {wallet_address}: {data.get('message', 'Unknown error')}")
+                        break
+                elif response.status == 429:
+                    logger.warning(f"Rate limit untuk Blockscout, menunggu...")
+                    await asyncio.sleep(2)
+                else:
+                    logger.error(f"Error fetching token transactions for {wallet_address}: HTTP {response.status}")
+                    break
+        except Exception as e:
+            logger.error(f"Exception fetching token transactions for {wallet_address}: {e}")
+            break
+    logger.warning(f"Total {len(token_transactions)} transaksi token diambil dari Blockscout untuk {wallet_address}")
+    return token_transactions
 
 # Fungsi untuk mendapatkan transaksi token dari Blockscout secara async
 async def get_token_transactions_blockscout_async(session, wallet_address):
@@ -317,18 +449,17 @@ def display_results(wallet_address, method_status, method_details, all_functions
 
 # Fungsi untuk memproses satu dompet
 async def process_wallet(wallet, session):
+    start_time = time.time()
     print(f"\nMemeriksa dompet: {wallet}")
     print("Sabar dan tunggu sambil ngopi, checker sedang berlangsung...")
     logger.warning(f"Memulai pemeriksaan untuk dompet: {wallet}")
 
-    # Cek cache
     cached_data = load_cache(wallet)
     if cached_data:
         transactions = cached_data.get("transactions", [])
         token_transactions = cached_data.get("token_transactions", [])
         logger.info(f"Menggunakan data dari cache untuk {wallet}")
     else:
-        # Ambil data dari Blockscout
         async with aiohttp.ClientSession() as blockscout_session:
             blockscout_tasks = [
                 get_transactions_blockscout_async(blockscout_session, wallet),
@@ -338,12 +469,9 @@ async def process_wallet(wallet, session):
 
         if not transactions and not token_transactions:
             logger.error(f"Tidak ada transaksi ditemukan untuk {wallet}. Mungkin dompet belum digunakan.")
-            method_status = {method: False for method in CONFIG["METHODS"]}
-            method_details = {method: [] for method in CONFIG["METHODS"]}
-            all_functions = set()
-            display_results(wallet, method_status, method_details, all_functions)
-            print(f"Tidak ada transaksi ditemukan untuk {wallet}. Periksa status dompet di https://sepolia.tea.xyz/address/{wallet}")
-            return
+            result = f"Tidak ada transaksi ditemukan untuk {wallet}. Periksa status dompet di https://sepolia.tea.xyz/address/{wallet}"
+            print(result)
+            return result
 
         save_cache(wallet, {
             "transactions": transactions,
@@ -352,7 +480,9 @@ async def process_wallet(wallet, session):
         logger.warning(f"Data disimpan ke cache untuk {wallet}")
 
     method_status, method_details, all_functions = await check_methods(transactions, token_transactions, wallet)
-    display_results(wallet, method_status, method_details, all_functions)
+    result = display_results(wallet, method_status, method_details, all_functions)
+    logger.info(f"Selesai memeriksa dompet {wallet} dalam %.2f detik", time.time() - start_time)
+    return result
 
 # Main program
 async def main():
@@ -375,3 +505,11 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
+# Hapus atau komentari:
+# async def main():
+#     clear_cache()
+#     print("Masukkan alamat dompet (pisahkan dengan koma, atau ketik 'ok' untuk mengakhiri):")
+#     ...
+# if __name__ == "__main__":
+#     asyncio.run(main())
